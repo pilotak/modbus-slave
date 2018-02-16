@@ -55,19 +55,21 @@ class ModbusSlave {
     };
 
     ModbusSlave(Serial * serial_obj, PinName de = NC, PinName re = NC);
-    void init(uint8_t slave_id);
+    void init(uint8_t slave_id, uint32_t baud, uint8_t bits = 8, SerialBase::Parity parity = SerialBase::None, uint8_t stop_bits = 1);
     void sendPacket(const uint8_t* data, uint8_t len);
     void sleep(bool state);
-    void write(uint8_t index, const uint8_t * data, uint8_t len);
-    void write(uint8_t index, uint16_t data);
+    void write(uint16_t index, const uint8_t * data, uint8_t len);
+    void write(uint16_t index, uint16_t data);
+    void write(uint16_t index, uint8_t data, uint8_t byte);
+    void writeBit(uint16_t index, uint8_t pos, bool bit);
+    void writeLong(uint16_t index, uint32_t data);
     uint16_t crc(const uint8_t *data, uint8_t len);
+    void offset(int16_t offset);
 
   private:
-    void rx_cb(int event);
-    void tx_done_cb(int event);
-    bool _sleep;
+    bool    _sleep;
     uint8_t _slave_id;
-    uint8_t test[7];
+    uint16_t _addr_offset;
     uint8_t _rx_buffer[8];
     uint8_t _store_buffer[(N * 2)];
 #if N > 125
@@ -75,29 +77,73 @@ class ModbusSlave {
 #else
     uint8_t _tx_buffer[(N * 2) + 5];
 #endif
+    uint16_t _t15; // inter character time out
+    uint16_t _t35; // frame delay
 
+    void rx_cb(int event);
+    void tx_done_cb(int event);
     void exceptionResponse(Exception type, FunctionCode fn);
+    void setRxCb();
 
   protected:
     Serial * _serial;
     DigitalOut _de;
     DigitalOut _re;
     Mutex _mutex;
+    Timeout timeout;
 };
 
 template <uint8_t N>
 ModbusSlave<N>::ModbusSlave(Serial * serial_obj, PinName de, PinName re):
     _sleep(true),
+    _addr_offset(0),
     _de(de),
     _re(re) {
     _serial = serial_obj;
     sleep(true);
 
     memset(_rx_buffer, UCHAR_MAX, 8);
+    memset(_store_buffer, UCHAR_MAX, N);
+
+#if N > 125
+    memset(_tx_buffer, UCHAR_MAX, 255);
+#else
+    memset(_tx_buffer, UCHAR_MAX, (N * 2) + 5);
+#endif
 }
 
 template <uint8_t N>
-void ModbusSlave<N>::init(uint8_t slave_id) {
+void ModbusSlave<N>::init(uint8_t slave_id, uint32_t baud, uint8_t bits, SerialBase::Parity parity, uint8_t stop_bits) {
+    /*Modbus states that a baud rate higher than 19200 must use a fixed 750 us
+    for inter character time out and 1.75 ms for a frame delay for baud rates
+    below 19200 the timing is more critical and has to be calculated.
+    E.g. 9600 baud in a 11 bit packet is 9600/11 = 872 characters per second
+    In milliseconds this will be 872 characters per 1000ms. So for 1 character
+    1000ms/872 characters is 1.14583ms per character and finally modbus states
+    an inter-character must be 1.5T or 1.5 times longer than a character. Thus
+    1.5T = 1.14583ms * 1.5 = 1.71875ms. A frame delay is 3.5T.
+    Thus the formula is T1.5(us) = (1000ms * 1000(us) * 1.5 * 11bits)/baud
+    1000ms * 1000(us) * 1.5 * 11bits = 16500000 can be calculated as a constant*/
+
+    if (baud > 19200) {
+        _t15 = 750;
+
+    } else {
+        _t15 = 16500000 / baud; // 1T * 1.5 = T1.5
+    }
+
+    /* The modbus definition of a frame delay is a waiting period of 3.5 character times
+    between packets. This is not quite the same as the frameDelay implemented in
+    this library but does benifit from it.
+    The frameDelay variable is mainly used to ensure that the last character is
+    transmitted without truncation. A value of 2 character times is chosen which
+    should suffice without holding the bus line high for too long.*/
+
+    _t35 = _t15 * 3.5;
+
+    _serial->baud(baud);
+    _serial->format (bits, parity, stop_bits);
+
     sleep(false);
     _slave_id = slave_id;
 }
@@ -110,15 +156,17 @@ void ModbusSlave<N>::rx_cb(int event) {
 
         if (crc(_rx_buffer, 6) == ((_rx_buffer[7] << 8) | _rx_buffer[6])) { // if the calculated crc matches the received crc
             if (_rx_buffer[0] == _slave_id || _rx_buffer[0] == 0) {
-                uint16_t starting_address = ((_rx_buffer[2] << 8) | _rx_buffer[3]); // combine the starting address bytes
+                uint16_t starting_address = ((_rx_buffer[2] << 8) | _rx_buffer[3]) + _addr_offset; // combine the starting address bytes
                 uint16_t no_of_registers = ((_rx_buffer[4] << 8) | _rx_buffer[5]); // combine the number of register bytes
 
                 if (_rx_buffer[1] == fc03) {
+                    printf("starting address: %u\n", starting_address);
+
                     if (starting_address < N) { // check exception 2 ILLEGAL DATA ADDRESS
-                        if ((starting_address + N) <= N) { // check exception 3 ILLEGAL DATA VALUE
+                        if ((starting_address + no_of_registers) <= N) { // check exception 3 ILLEGAL DATA VALUE
                             uint8_t no_of_bytes = no_of_registers * 2;
                             printf("no of regiters: %u bytes: %u\n", no_of_registers, no_of_bytes);
-                            printf("starting address: %u\n", starting_address);
+
 
                             uint8_t response_frame_size = 5 + no_of_bytes;
 
@@ -129,7 +177,7 @@ void ModbusSlave<N>::rx_cb(int event) {
                             printf("frame_size: %u\n", response_frame_size);
 
                             _mutex.lock();
-                            memcpy(_tx_buffer + 3, _store_buffer, no_of_bytes);
+                            memcpy(_tx_buffer + 3, _store_buffer + starting_address, no_of_bytes);
                             _mutex.unlock();
 
                             uint16_t crc16 = crc(_tx_buffer, no_of_bytes + 3);
@@ -162,6 +210,11 @@ void ModbusSlave<N>::rx_cb(int event) {
         printf("RX error: %i\n", event);
     }
 
+    timeout.attach_us(callback(this, &ModbusSlave<N>::setRxCb), _t35);
+}
+
+template <uint8_t N>
+void ModbusSlave<N>::setRxCb() {
     _serial->read(_rx_buffer, 8, event_callback_t(this, &ModbusSlave::rx_cb), SERIAL_EVENT_RX_ALL);
 }
 
@@ -179,7 +232,7 @@ void ModbusSlave<N>::sendPacket(const uint8_t* data, uint8_t len) {
 
         if (_re != NC) _re.write(1);
 
-        _serial->write(_tx_buffer, len, event_callback_t(this, &ModbusSlave::tx_done_cb));
+        _serial->write(data, len, event_callback_t(this, &ModbusSlave::tx_done_cb));
     }
 
 }
@@ -187,6 +240,8 @@ void ModbusSlave<N>::sendPacket(const uint8_t* data, uint8_t len) {
 template <uint8_t N>
 void ModbusSlave<N>::sleep(bool state) {
     if (state) {
+        _serial->abort_write();
+        _serial->abort_read();
         _serial->read(_rx_buffer, 0, 0, 0);
 
         if (_de != NC) _de.write(0); //shutdown mode
@@ -205,32 +260,69 @@ void ModbusSlave<N>::sleep(bool state) {
 }
 
 template <uint8_t N>
-void ModbusSlave<N>::write(uint8_t index, const uint8_t * data, uint8_t len) {
+void ModbusSlave<N>::write(uint16_t index, const uint8_t * data, uint8_t len) {
     _mutex.lock();
-    memcpy(_store_buffer + index, data, len);
+    memcpy(_store_buffer + (index * 2), data, len);
     _mutex.unlock();
 }
 
 template <uint8_t N>
-void ModbusSlave<N>::write(uint8_t index, uint16_t data) {
+void ModbusSlave<N>::write(uint16_t index, uint16_t data) {
     _mutex.lock();
-    _store_buffer[index] = (data >> 8);
-    _store_buffer[index + 1] = (data & UCHAR_MAX);
+    _store_buffer[(index * 2)] = (data >> 8);
+    _store_buffer[(index * 2) + 1] = (data & UCHAR_MAX);
+    _mutex.unlock();
+}
+
+template <uint8_t N>
+void ModbusSlave<N>::write(uint16_t index, uint8_t data, uint8_t byte) {
+    _mutex.lock();
+    _store_buffer[(index * 2) + byte] = data;
+    _mutex.unlock();
+}
+
+template <uint8_t N>
+void ModbusSlave<N>::writeBit(uint16_t index, uint8_t pos, bool bit) {
+    uint8_t add = 0;
+    _mutex.lock();
+
+    if (pos > 7) {
+        pos -= 8;
+        add = 1;
+    }
+
+    _store_buffer[(index * 2) + add] ^= (-(bit) ^ _store_buffer[(index * 2) + add]) & (1 << pos);
+
+    _mutex.unlock();
+}
+
+template <uint8_t N>
+void ModbusSlave<N>::writeLong(uint16_t index, uint32_t data) {
+    _mutex.lock();
+    _store_buffer[(index * 2)] = data >> 24;
+    _store_buffer[(index * 2) + 1] = (data >> 16) & UCHAR_MAX;
+    _store_buffer[(index * 2) + 2] = (data >> 8) & UCHAR_MAX;
+    _store_buffer[(index * 2) + 3] = data & UCHAR_MAX;
     _mutex.unlock();
 }
 
 template <uint8_t N>
 void ModbusSlave<N>::exceptionResponse(Exception type, FunctionCode fn) {
-    _tx_buffer[0] = _slave_id;
-    _tx_buffer[1] = (fn | 0x80);
-    _tx_buffer[2] = type;
+    printf("Exception:%u\n", type);
 
-    uint16_t crc16 = crc(_tx_buffer, 3);
+    uint8_t buffer[5];
 
-    _tx_buffer[3] = crc16 >> 8;
-    _tx_buffer[4] = crc16 & 0xFF;
+    buffer[0] = _slave_id;
+    buffer[1] = (fn | 0x80);
+    buffer[2] =  type;
 
-    sendPacket(_tx_buffer, 5);
+    uint16_t crc16 = crc(buffer, 3);
+    buffer[3] = (crc16 & UCHAR_MAX);
+    buffer[4] = (crc16 >> 8);
+
+    for (uint8_t i = 0; i < 5; ++i) {
+        _serial->putc(buffer[i]);
+    }
 }
 
 template <uint8_t N>
@@ -245,4 +337,9 @@ uint16_t ModbusSlave<N>::crc(const uint8_t *data, uint8_t len) {
     }
 
     return result;
+}
+
+template <uint8_t N>
+void ModbusSlave<N>::offset(int16_t offset) {
+    _addr_offset = offset;
 }

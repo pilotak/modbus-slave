@@ -5,14 +5,14 @@ Uses async serial implementation. Currently only FC3 - Read Holding Registers su
 #include <mbed.h>
 #include "ModbusSlave.h"
 
-Serial mdbSerial(PD_8, PD_9, 9600);
+Serial mdbSerial(PD_8, PD_9);
 // register size=125, serial object, DE pin, RE pin
 ModbusSlave<125> modbus(&mdbSerial, PD_15, PE_5);
 
 #define SLAVE_ID 0x02
 
 int main() {
-  modbus.init(SLAVE_ID);
+  modbus.init(SLAVE_ID, 9600); // 9600 baud
   uint16_t counter = 0;
 
   while (1){
